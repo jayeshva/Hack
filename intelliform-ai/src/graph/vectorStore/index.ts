@@ -1,1 +1,1 @@
-export * from "./govVectorStore.js"
+export * from "./govVectorStore"

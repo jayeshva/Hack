@@ -17,10 +17,13 @@ import Redis from 'ioredis';
 dotenv.config();
 
 import { ChatbotAgent } from './chatbot';
-import { runGraph, StateType } from './graph/graph';
+import { runGraph, StateType, createInitialSession, isValidSessionState } from './graph/graph';
 import { AIMessage } from '@langchain/core/messages';
+import { buildGovVectorStore } from './graph/vectorStore';
 
 const logger = createLogger('server');
+
+
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -48,12 +51,14 @@ class ChatWebSocketServer {
   private chatbotAgent: ChatbotAgent;
   private upload: multer.Multer;
 
+
+
   constructor() {
     this.app = express();
     this.server = createServer(this.app);
     this.wss = new WebSocketServer({ server: this.server });
     this.chatbotAgent = new ChatbotAgent();
-    
+
     // Configure file upload
     this.upload = multer({
       dest: 'uploads/',
@@ -69,7 +74,7 @@ class ChatWebSocketServer {
           'application/json', 'application/msword',
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         ];
-        
+
         if (allowedTypes.includes(file.mimetype)) {
           cb(null, true);
         } else {
@@ -91,7 +96,7 @@ class ChatWebSocketServer {
       return undefined;
     }
   }
-  
+
   async saveSessionState(sessionId: string, state: StateType): Promise<void> {
     try {
       await redis.set(`session:${sessionId}`, JSON.stringify(state), 'EX', 60 * 60); // Expires in 1 hour
@@ -100,7 +105,7 @@ class ChatWebSocketServer {
       console.error("Redis set error:", error);
     }
   }
-  
+
 
   private setupExpress() {
     // CORS configuration
@@ -117,8 +122,8 @@ class ChatWebSocketServer {
 
     // Health check
     this.app.get('/health', (req, res) => {
-      res.json({ 
-        status: 'healthy', 
+      res.json({
+        status: 'healthy',
         connections: this.clients.size,
         timestamp: new Date().toISOString()
       });
@@ -148,12 +153,12 @@ class ChatWebSocketServer {
     this.app.post('/api/chat', async (req, res) => {
       try {
         const { message, sessionId, files } = req.body;
-        
+
         // Process with AI agent
         const response = await this.chatbotAgent.chat(sessionId, message);
-        
-        res.json({ 
-          response, 
+
+        res.json({
+          response,
           sessionId,
           timestamp: new Date().toISOString()
         });
@@ -168,16 +173,16 @@ class ChatWebSocketServer {
     this.wss.on('connection', (ws: WebSocket, request) => {
       const url = new URL(request.url!, `http://${request.headers.host}`);
       const sessionId = url.searchParams.get('sessionId') || uuidv4();
-      
+
       console.log(`Client connected: ${sessionId}`);
-      
+
       // Store client connection
       const clientConnection: ClientConnection = {
         ws,
         sessionId,
         lastActivity: new Date()
       };
-      
+
       this.clients.set(sessionId, clientConnection);
 
       // Send welcome message
@@ -235,64 +240,43 @@ class ChatWebSocketServer {
 
   private async handleMessage(sessionId: string, message: any) {
     const client = this.clients.get(sessionId);
-    logger.info(`client`, client);
     if (!client) return;
 
     try {
-      // Update last activity
       client.lastActivity = new Date();
 
-      // Show typing indicator
       this.sendMessage(client.ws, {
         type: 'typing',
         isTyping: true
       });
 
       let processedFiles: FileData[] = [];
-
-      // Handle file uploads in message
-      if (message.files && message.files.length > 0) {
+      if (message.files?.length > 0) {
         processedFiles = await this.processMessageFiles(message.files);
       }
 
-      // Process message with AI agent
-      // const aiResponse = await test(message.content);
-      const previousState = await this.getSessionState(sessionId) || {};
+      const previousState = (await this.getSessionState(sessionId) || {}) as Partial<StateType>;
+      previousState.input = message.content;
 
-      logger.info(`previousState: ${JSON.stringify(previousState)}`);
-      logger.info(`message.content: ${message.content}`);
+      const resultState = await runGraph(message.content, previousState);
 
-      const resultState = await runGraph(message.content, {});
-      logger.info(`resultState: ${JSON.stringify(resultState)}`);
 
-       const lastBotMessage = resultState.chat_history?.[resultState.chat_history.length - 1] as AIMessage;
 
-      // 💾 Save session to Redis
-      await this.saveSessionState(sessionId, resultState); 
-  
-      // // 📤 Send bot response
-      // const lastBotMessage = resultState.chat_history?.[resultState.chat_history.length - 1] as AIMessage;
 
-      // const aiResponse = await runGraph(message.content);
-      // logger.debug('AI response:', aiResponse);
+      const lastBotMessage = resultState.chat_history?.[resultState.chat_history.length - 1] as AIMessage;
 
-    
+      await this.saveSessionState(sessionId, resultState);  // 💾 Save updated session
 
-      // Check if AI wants to send files back
-      // const responseFiles = await this.handleAIResponseFiles(aiResponse);
-
-      // Send AI response
       this.sendMessage(client.ws, {
         type: 'message',
         content: lastBotMessage?.content || "Done.",
-        // files: responseFiles,
         sessionId,
         timestamp: new Date().toISOString()
       });
 
     } catch (error: any) {
       console.error('Message processing error:', error);
-      
+
       this.sendMessage(client.ws, {
         type: 'error',
         content: 'Sorry, I encountered an error processing your message. Please try again.',
@@ -300,6 +284,7 @@ class ChatWebSocketServer {
       });
     }
   }
+
 
   private async processMessageFiles(files: any[]): Promise<FileData[]> {
     const processedFiles: FileData[] = [];
@@ -311,9 +296,9 @@ class ChatWebSocketServer {
           const buffer = Buffer.from(file.data.split(',')[1], 'base64');
           const filename = `${uuidv4()}_${file.name}`;
           const filepath = path.join('uploads', filename);
-          
+
           await fs.promises.writeFile(filepath, buffer);
-          
+
           processedFiles.push({
             id: file.id || uuidv4(),
             name: file.name,
@@ -335,19 +320,19 @@ class ChatWebSocketServer {
     // Parse AI response for file generation requests
     // This is where you'd handle cases where the AI wants to generate files
     // (e.g., filled forms, reports, documents)
-    
+
     const files: FileData[] = [];
-    
+
     // Example: Check if AI response contains file generation instructions
     if (response.includes('[GENERATE_FORM]')) {
       // Generate a form file
       const formContent = this.generateFormContent(response);
       const filename = `form_${uuidv4()}.pdf`;
       const filepath = path.join('uploads', filename);
-      
+
       // Save generated file
       await fs.promises.writeFile(filepath, formContent);
-      
+
       files.push({
         id: uuidv4(),
         name: 'Generated Form.pdf',
@@ -357,7 +342,7 @@ class ChatWebSocketServer {
         url: `/uploads/${filename}`
       });
     }
-    
+
     return files;
   }
 
@@ -373,7 +358,8 @@ class ChatWebSocketServer {
     }
   }
 
-  public start(port: number = 3001) {
+  public async start(port: number = 3001) {
+    await buildGovVectorStore();
     this.server.listen(port, () => {
       console.log(`Chat server running on port ${port}`);
       console.log(`WebSocket endpoint: ws://localhost:${port}/chat`);

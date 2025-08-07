@@ -6,14 +6,21 @@ import {
   BaseMessage,
   SystemMessage,
 } from "@langchain/core/messages";
+import { ConversationTokenBufferMemory } from 'langchain/memory';
+
 import { statusTrackingAgent } from "./agents";
 import logger from "../common/logger";
+import { llm } from "../config/llm";
 import { formAssistantAgent } from "./agents/formAssistant";
 
 // ------------------------------
 // Session State Definition
 // ------------------------------
 const StateAnnotation = Annotation.Root({
+  memory: Annotation<ConversationTokenBufferMemory>({
+    reducer: (current, update) => update ?? current,
+    default: () => new ConversationTokenBufferMemory({ memoryKey: 'chat_history', llm,maxTokenLimit: 2000 }),
+  }),
   input: Annotation<string>,
   chat_history: Annotation<BaseMessage[]>({
     reducer: (current, update) => update ?? current,
@@ -70,10 +77,7 @@ type StateType = typeof StateAnnotation.State;
 // ------------------------------
 // LLM Initialization
 // ------------------------------
-const llm = new BedrockChat({
-  model: "anthropic.claude-3-haiku-20240307-v1:0",
-  region: process.env.AWS_REGION || "us-east-1",
-});
+
 
 // ------------------------------
 // Router Node
@@ -202,17 +206,19 @@ async function formAssistantNode(state: StateType): Promise<Partial<StateType>> 
     // }
 
     const result = await formAssistantAgent(state.input, state);
+    const { chat_history: _omit, ...rest } = result;
 
     return {
       chat_history: [
         ...state.chat_history,
         new HumanMessage({ content: state.input }),
-        new AIMessage({ content: result?.response.trimEnd() }),
+        new AIMessage({ content: result?.response }),
       ],
-      ...result,  // This spreads all updated state fields
+      ...rest,
       last_node: state.current_node,
       current_node: "form_assistant_agent",
     };
+
   } catch (error) {
     console.error("Form assistant error:", error);
     return {
@@ -269,7 +275,7 @@ const builder = new StateGraph(StateAnnotation)
   .addNode("status_tracking_agent", statusTrackingNode)
   .addEdge(START, "router")
   .addConditionalEdges("router", routeToAgent, {
-   form_assistant_agent: "form_assistant_agent",
+    form_assistant_agent: "form_assistant_agent",
     status_tracking_agent: "status_tracking_agent",
   })
   .addEdge("form_assistant_agent", END)
@@ -331,8 +337,9 @@ export function createInitialSession(): StateType {
     form_fields: undefined,
     current_field: undefined,
     last_field: undefined,
-    isFormfillingInterupted: false
-  } as StateType;
+    isFormfillingInterupted: false,
+    memory: new ConversationTokenBufferMemory({ memoryKey: 'chat_history', llm })
+  };
 }
 
 // ------------------------------
