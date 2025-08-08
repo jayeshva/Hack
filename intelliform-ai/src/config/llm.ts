@@ -14,7 +14,7 @@ const langfuseHandler = new CallbackHandler({
 export const llm = new BedrockChat({
   model: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0', 
   region: process.env.AWS_REGION || 'us-east-2',
-  temperature: 0.4,
+  temperature: 0.1,
   streaming: true,
 })
  

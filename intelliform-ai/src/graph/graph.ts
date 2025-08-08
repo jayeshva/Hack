@@ -11,6 +11,8 @@ import { statusTrackingAgent } from "./agents";
 import logger from "../common/logger";
 import { llm } from "../config/llm";
 import { formAssistantAgent, formAssistantAgentSimple } from "./agents/formAssistant";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { Runnable } from "@langchain/core/runnables";
 
 // ------------------------------
 // Session State Definition
@@ -81,6 +83,10 @@ const StateAnnotation = Annotation.Root({
     default: () => undefined,
   }),
   isFormfillingInterupted: Annotation<boolean>({
+    reducer: (current, update) => update ?? current,
+    default: () => false
+  }),
+  isFormReady: Annotation<boolean>({
     reducer: (current, update) => update ?? current,
     default: () => false
   })
@@ -182,6 +188,13 @@ Do NOT explain. Just return the route name.
 // ------------------------------
 const routeToAgent = (state: StateType): string => {
   logger.info(`Routing to agent: ${state.current_node}`);
+
+  if(state.is_form_filling_started === true) {
+    return "form_filling_agent";
+  }
+  else if(state.isFormReady){
+    return "submit_form";
+  }
   switch (state.current_node) {
     case "form_assistant_agent":
       return "form_assistant_agent";
@@ -299,6 +312,105 @@ async function statusTrackingNode(state: StateType): Promise<Partial<StateType>>
   }
 }
 
+async function formFillingNode(state: StateType): Promise<Partial<StateType>> {
+  try {
+    const { form_fields, current_field, input } = state;
+
+    const currentFieldObj = form_fields?.find(f => f.name === current_field);
+    if (!currentFieldObj) {
+      return { ...state };
+    }
+
+    // Save user input to current field
+    const updatedFields = form_fields?.map(f =>
+      f.name === current_field ? { ...f, value: input } : f
+    );
+
+    const remainingFields = updatedFields?.filter(
+      (f) => f.required && (f.value === null || f.value === "")
+    );
+
+    const nextField = remainingFields?.[0];
+
+    const updatedState: Partial<StateType> = {
+      chat_history: [...(state.chat_history || []), new HumanMessage({ content: input })],
+      form_fields: updatedFields,
+      current_field: nextField?.name,
+      form_status: "in_progress",
+    };
+
+    if ( remainingFields && remainingFields.length > 0) {
+      const prompt = ChatPromptTemplate.fromMessages([
+        ["system", "You are a helpful assistant collecting form data from a user."],
+        ["human", `Please provide: ${nextField.label}\n${nextField.instruction}`],
+      ]);
+      const llmInput = await prompt.formatMessages({});
+      const aiResponse = await llm.invoke(llmInput);
+
+      updatedState.chat_history?.push(new AIMessage({ content: aiResponse.content }));
+    } else {
+      // All fields filled → Ask LLM to summarize and request confirmation
+      const formSummary = updatedFields
+        ?.map(f => `- ${f.label}: ${f.value}`)
+        .join("\n");
+
+      const prompt = ChatPromptTemplate.fromMessages([
+        ["system", "You are an assistant confirming collected form data with the user."],
+        ["human", `Here is the filled form:\n${formSummary}\n\nPlease summarize this politely and ask the user: 'Do you want to submit this form?'`],
+      ]);
+      const messages = await prompt.formatMessages({});
+      const llmResponse = await llm.invoke(messages);
+
+      updatedState.chat_history?.push(new AIMessage({ content: llmResponse.content }));
+      updatedState.is_form_filling_started = false;
+      updatedState.form_status = "completed";
+      updatedState.isFormReady = true;
+    }
+
+    return updatedState;
+
+  } catch (error: any) {
+    logger.error(`Form filling error: ${error.message}`);
+    return {
+      ...state,
+      form_status: "in_progress",
+    };
+  }
+}
+
+
+
+async function submitFormNode(state: StateType): Promise<Partial<StateType>> {
+  const formData = Object.fromEntries(
+    (state.form_fields || []).map((f) => [f.name, f.value])
+  );
+
+  logger.info("Submitting form data:", formData);
+
+  // Replace this with real API call or logic
+  const confirmationMessage = `✅ Your "${state.form_name}" form has been submitted successfully.\n\nSummary:\n${Object.entries(formData)
+    .map(([k, v]) => `• ${k}: ${v}`)
+    .join("\n")}`;
+
+  const aiMessage = new AIMessage({ content: confirmationMessage });
+
+  return {
+    chat_history: [...(state.chat_history || []), aiMessage],
+    current_node: "submit_form",
+    last_node: state.current_node,
+    awaiting_input: false,
+    is_form_filling_started: false,
+    form_id: undefined,
+    form_name: undefined,
+    form_fields: undefined,
+    current_field: undefined,
+    last_field: undefined,
+    isFormfillingInterupted: false,
+    form_status: undefined,
+  };
+}
+
+
 // ------------------------------
 // Build LangGraph
 // ------------------------------
@@ -306,10 +418,14 @@ const builder = new StateGraph(StateAnnotation)
   .addNode("router", routerNode)
   .addNode("form_assistant_agent", formAssistantNode)
   .addNode("status_tracking_agent", statusTrackingNode)
+  .addNode("form_filling_agent", formFillingNode)
+  .addNode("submit_form", submitFormNode)
   .addEdge(START, "router")
   .addConditionalEdges("router", routeToAgent, {
     form_assistant_agent: "form_assistant_agent",
     status_tracking_agent: "status_tracking_agent",
+    form_filling_agent: "form_filling_agent",
+    submit_form: "submit_form",
   })
   .addEdge("form_assistant_agent", END)
   .addEdge("status_tracking_agent", END);
@@ -345,7 +461,7 @@ export async function runGraph(input: string, session: Partial<StateType> = {}):
 
     return result as StateType;
   } catch (error) {
-    logger.error("Graph execution error:", error);
+    logger.error(`Graph execution error: ${error}`);
     
     // Return a safe fallback state with preserved history
     const fallbackResponse = "I apologize, but I encountered an error. Please try your request again.";
@@ -396,16 +512,29 @@ export function createInitialSession(): StateType {
     last_node: null,
     awaiting_input: false,
     is_form_filling_started: false,
-    form_status: "not_started",
-    form_id: undefined,
+    form_status: undefined,
+    form_id: undefined ,
     form_name: undefined,
     form_fields: undefined,
     current_field: undefined,
     last_field: undefined,
     isFormfillingInterupted: false,
-    memory
+    memory,
+    isFormReady: false
   };
 }
+
+const PAN_FORM_FIELDS = [
+  { name: "full_name", type: "text", required: true, label: "Full Name", instruction: "Enter your full name as per official documents." },
+  { name: "father_name", type: "text", required: true, label: "Father's Name", instruction: "Enter your father's full name." },
+  { name: "dob", type: "date", required: true, label: "Date of Birth", instruction: "DD/MM/YYYY." },
+  { name: "gender", type: "radio", required: true, label: "Gender", options: ["Male", "Female", "Other"], instruction: "Select your gender." },
+  { name: "aadhaar_number", type: "text", required: true, label: "Aadhaar Number", instruction: "12-digit Aadhaar." },
+  { name: "mobile_number", type: "text", required: true, label: "Mobile Number", instruction: "10-digit mobile." },
+  { name: "address", type: "text", required: true, label: "Address", instruction: "Full residential address." },
+  { name: "declaration_consent", type: "checkbox", required: true, label: "Declaration Consent", instruction: "Confirm all info is true." },
+];
+
 
 // ------------------------------
 // Type Guards and Validation
