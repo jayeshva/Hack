@@ -1,5 +1,4 @@
 import { END, StateGraph, Annotation, START } from "@langchain/langgraph";
-import { BedrockChat } from "@langchain/community/chat_models/bedrock";
 import {
   HumanMessage,
   AIMessage,
@@ -11,7 +10,7 @@ import { ConversationTokenBufferMemory } from 'langchain/memory';
 import { statusTrackingAgent } from "./agents";
 import logger from "../common/logger";
 import { llm } from "../config/llm";
-import { formAssistantAgent } from "./agents/formAssistant";
+import { formAssistantAgent, formAssistantAgentSimple } from "./agents/formAssistant";
 
 // ------------------------------
 // Session State Definition
@@ -19,11 +18,26 @@ import { formAssistantAgent } from "./agents/formAssistant";
 const StateAnnotation = Annotation.Root({
   memory: Annotation<ConversationTokenBufferMemory>({
     reducer: (current, update) => update ?? current,
-    default: () => new ConversationTokenBufferMemory({ memoryKey: 'chat_history', llm,maxTokenLimit: 2000 }),
+    default: () => new ConversationTokenBufferMemory({ 
+      memoryKey: 'chat_history', 
+      llm,
+      maxTokenLimit: 2000,
+      returnMessages: true 
+    }),
   }),
   input: Annotation<string>,
   chat_history: Annotation<BaseMessage[]>({
-    reducer: (current, update) => update ?? current,
+    reducer: (current, update) => {
+      // Always append new messages to preserve history
+      if (!current) return update || [];
+      if (!update) return current;
+      
+      // If update contains new messages, append them
+      const currentIds = new Set(current.map((msg, idx) => `${msg._getType()}-${idx}`));
+      const newMessages = update.filter((msg, idx) => !currentIds.has(`${msg._getType()}-${idx}`));
+      
+      return [...current, ...newMessages];
+    },
     default: () => [],
   }),
   current_node: Annotation<string | null>({
@@ -75,11 +89,6 @@ const StateAnnotation = Annotation.Root({
 type StateType = typeof StateAnnotation.State;
 
 // ------------------------------
-// LLM Initialization
-// ------------------------------
-
-
-// ------------------------------
 // Router Node
 // ------------------------------
 async function routerNode(state: StateType): Promise<{ current_node: string; last_node: string | null }> {
@@ -89,32 +98,28 @@ You are a router agent responsible for deciding which specialized agent to route
 
 You have access to the following agents and their capabilities:
 
-1. form_assistant_agent – Helps answer general, vague, or open-ended queries. It can fetch available form list, form schema, and use retrieval tools for FAQs and general information.
+1. form_assistant_agent – Helps with general questions, fetches forms, guides form filling, and handles user interactions during the application process.
 
-2. form_assistant_agent – Guides users step-by-step to fill a selected form using current context. It can collect inputs, edit/delete fields, and validate responses.
-
-3. status_tracking_agent – Answers user queries about the progress or status of submitted applications.
+2. status_tracking_agent – Answers user queries about the progress or status of submitted applications.
 
 ---
 
 🔁 Routing Rules:
 
 - Route to \`form_assistant_agent\` if:
-  - The user asks a general question about eligibility, form availability, fees, etc.
-  - The user gives short affirmations like “yes” or “okay” **without sufficient context**.
-  - The user asks "how to", "what do I need", "where can I", etc., which implies clarification is needed.
-  - The user message is vague or context-less, and does not include form name or intent to proceed.
-
-- Route to \`form_assistant_agent\` if:
-  - The user explicitly wants to start or proceed with filling a form.
-  - The user affirms **after previously being asked to confirm starting the form**.
-  - The message contains intent to provide details like name, dob, email, address, etc.
-  - The message includes phrases like “start application”, “continue filling”, “submit”, or “fill the form”.
+  - The user asks general questions about eligibility, form availability, fees, etc.
+  - The user wants to start, continue, or complete filling a form
+  - The user gives responses during form filling (names, dates, addresses, etc.)
+  - The user asks "how to", "what do I need", "where can I", etc.
+  - The user gives short responses like "yes", "okay", "continue" during form interactions
+  - The user asks about available forms or services
+  - Default choice for most interactions
 
 - Route to \`status_tracking_agent\` if:
-  - The user asks about the status or result of a form or application.
-  - The user mentions tracking number, reference ID, or phrases like “submitted”, “processing”, “approval”, etc.
-  - The message includes phrases like “check my status”, “any update”, or “when will I get it”.
+  - The user explicitly asks about the status or result of a submitted form/application
+  - The user mentions tracking numbers, reference IDs, or application statuses
+  - The message includes phrases like "check my status", "any update", "when will I get it"
+  - The user asks about processing times or approval status
 
 ---
 
@@ -128,13 +133,13 @@ You have access to the following agents and their capabilities:
 - form_name: ${state.form_name || 'none'}
 - form_status: ${state.form_status || 'not_started'}
 - current_field: ${state.current_field || 'none'}
-- last_field: ${state.last_field || 'none'}
+- chat_history_length: ${state.chat_history?.length || 0}
 
 ---
 
 📥 User Message: "${state.input}"
 
-Now, based on this input and context, reply with ONLY ONE of the following route names:
+Based on this input and context, reply with ONLY ONE of the following route names:
 → form_assistant_agent
 → status_tracking_agent
 
@@ -145,7 +150,6 @@ Do NOT explain. Just return the route name.
   try {
     const response = await llm.invoke([
       routerPrompt,
-      ...state.chat_history,
       new HumanMessage({ content: state.input }),
     ]);
 
@@ -158,12 +162,14 @@ Do NOT explain. Just return the route name.
     const validRoutes = ["form_assistant_agent", "status_tracking_agent"];
     const selectedRoute = validRoutes.includes(content) ? content : "form_assistant_agent";
 
+    logger.info(`Routing to: ${selectedRoute}`);
+
     return {
       current_node: selectedRoute,
       last_node: state.current_node,
     };
   } catch (error) {
-    console.error("Router error:", error);
+    logger.error("Router error:", error);
     return {
       current_node: "form_assistant_agent",
       last_node: state.current_node,
@@ -189,43 +195,60 @@ const routeToAgent = (state: StateType): string => {
 // ------------------------------
 // Agent Nodes
 // ------------------------------
-
-
 async function formAssistantNode(state: StateType): Promise<Partial<StateType>> {
   try {
-    // if (!state.form_id && !state.form_fields && state.is_form_filling_started) {
-    //   return {
-    //     chat_history: [
-    //       ...state.chat_history,
-    //       new HumanMessage({ content: state.input }),
-    //       new AIMessage({ content: "Please first select a form to fill out. You can ask me 'What forms are available?' to see your options." })
-    //     ],
-    //     last_node: state.current_node,
-    //     current_node: "form_assistant_agent",
-    //   };
-    // }
+    logger.info(`Form assistant processing: "${state.input}"`);
+    logger.info(`Current form context: ${state.form_id ? `form_id=${state.form_id}` : 'no form'}`);
 
     const result = await formAssistantAgent(state.input, state);
-    const { chat_history: _omit, ...rest } = result;
+    
+    if (!result || !result.response) {
+      throw new Error("Invalid response from form assistant agent");
+    }
+
+    // Create the new messages
+    const humanMessage = new HumanMessage({ content: state.input });
+    const aiMessage = new AIMessage({ content: result.response });
+
+    // Build the updated chat history
+    const updatedChatHistory = [
+      ...(state.chat_history || []),
+      humanMessage,
+      aiMessage
+    ];
+
+    logger.info(`Form assistant response: "${result.response}"`);
+    logger.info(`Updated chat history length: ${updatedChatHistory.length}`);
 
     return {
-      chat_history: [
-        ...state.chat_history,
-        new HumanMessage({ content: state.input }),
-        new AIMessage({ content: result?.response }),
-      ],
-      ...rest,
+      chat_history: updatedChatHistory,
       last_node: state.current_node,
       current_node: "form_assistant_agent",
+      // Include all updated state from the agent
+      memory: result.memory || state.memory,
+      form_id: result.form_id ?? state.form_id,
+      form_name: result.form_name ?? state.form_name,
+      form_fields: result.form_fields ?? state.form_fields,
+      form_status: result.form_status ?? state.form_status,
+      current_field: result.current_field ?? state.current_field,
+      last_field: result.last_field ?? state.last_field,
+      awaiting_input: result.awaiting_input ?? state.awaiting_input,
+      is_form_filling_started: result.is_form_filling_started ?? state.is_form_filling_started,
+      isFormfillingInterupted: result.isFormfillingInterupted ?? state.isFormfillingInterupted,
     };
 
   } catch (error) {
-    console.error("Form assistant error:", error);
+    logger.error("Form assistant error:", error);
+    
+    const errorMessage = "I encountered an error while processing your form request. Please try again.";
+    const humanMessage = new HumanMessage({ content: state.input });
+    const aiMessage = new AIMessage({ content: errorMessage });
+
     return {
       chat_history: [
-        ...state.chat_history,
-        new HumanMessage({ content: state.input }),
-        new AIMessage({ content: "I encountered an error while processing your form. Please try again." })
+        ...(state.chat_history || []),
+        humanMessage,
+        aiMessage
       ],
       last_node: state.current_node,
       current_node: "form_assistant_agent",
@@ -233,38 +256,48 @@ async function formAssistantNode(state: StateType): Promise<Partial<StateType>> 
   }
 }
 
-
 async function statusTrackingNode(state: StateType): Promise<Partial<StateType>> {
   try {
+    logger.info(`Status tracking processing: "${state.input}"`);
+
     const result = await statusTrackingAgent.invoke({
       input: state.input,
       form_id: state.form_id,
       chat_history: state.chat_history
     });
 
+    const humanMessage = new HumanMessage({ content: state.input });
+    const aiMessage = new AIMessage({ content: result.output });
+
+    logger.info(`Status tracking response: "${result.output}"`);
+
     return {
       chat_history: [
-        ...state.chat_history,
-        new HumanMessage({ content: state.input }),
-        new AIMessage({ content: result.output })
+        ...(state.chat_history || []),
+        humanMessage,
+        aiMessage
       ],
       last_node: state.current_node,
       current_node: "status_tracking_agent",
     };
   } catch (error) {
-    console.error("Status tracking agent error:", error);
+    logger.error("Status tracking agent error:", error);
+    
+    const errorMessage = "I'm having trouble checking the form status. Please try again later or provide more details.";
+    const humanMessage = new HumanMessage({ content: state.input });
+    const aiMessage = new AIMessage({ content: errorMessage });
+
     return {
       chat_history: [
-        ...state.chat_history,
-        new HumanMessage({ content: state.input }),
-        new AIMessage({ content: "I'm having trouble checking the form status. Please try again later." })
+        ...(state.chat_history || []),
+        humanMessage,
+        aiMessage
       ],
       last_node: state.current_node,
       current_node: "status_tracking_agent",
     };
   }
 }
-
 
 // ------------------------------
 // Build LangGraph
@@ -281,7 +314,6 @@ const builder = new StateGraph(StateAnnotation)
   .addEdge("form_assistant_agent", END)
   .addEdge("status_tracking_agent", END);
 
-
 // Compile the graph
 export const appGraph = builder.compile();
 
@@ -290,23 +322,42 @@ export const appGraph = builder.compile();
 // ------------------------------
 export async function runGraph(input: string, session: Partial<StateType> = {}): Promise<StateType> {
   try {
+    logger.info(`Running graph with input: "${input}"`);
+    logger.info(`Session chat history length: ${session.chat_history?.length || 0}`);
+
+    // Ensure memory exists
+    if (!session.memory) {
+      session.memory = new ConversationTokenBufferMemory({ 
+        memoryKey: 'chat_history', 
+        llm,
+        maxTokenLimit: 2000,
+        returnMessages: true 
+      });
+    }
+
     const result = await appGraph.invoke({
       input,
       ...session,
     });
-    logger.info(`Graph execution result: ${JSON.stringify(result)}`);
+
+    logger.info(`Graph execution completed`);
+    logger.info(`Result chat history length: ${result.chat_history?.length || 0}`);
+
     return result as StateType;
   } catch (error) {
-    console.error("Graph execution error:", error);
-    // Return a safe fallback state
+    logger.error("Graph execution error:", error);
+    
+    // Return a safe fallback state with preserved history
+    const fallbackResponse = "I apologize, but I encountered an error. Please try your request again.";
+    
     return {
       input,
       chat_history: [
         ...(session.chat_history || []),
         new HumanMessage({ content: input }),
-        new AIMessage({ content: "I apologize, but I encountered an error. Please try your request again." })
+        new AIMessage({ content: fallbackResponse })
       ],
-      current_node: "clarification_agent",
+      current_node: "form_assistant_agent",
       last_node: session.current_node || null,
       awaiting_input: false,
       is_form_filling_started: session.is_form_filling_started || false,
@@ -316,6 +367,13 @@ export async function runGraph(input: string, session: Partial<StateType> = {}):
       form_fields: session.form_fields,
       current_field: session.current_field,
       last_field: session.last_field,
+      isFormfillingInterupted: session.isFormfillingInterupted || false,
+      memory: session.memory || new ConversationTokenBufferMemory({ 
+        memoryKey: 'chat_history', 
+        llm,
+        maxTokenLimit: 2000000,
+        returnMessages: true 
+      })
     } as StateType;
   }
 }
@@ -324,6 +382,13 @@ export async function runGraph(input: string, session: Partial<StateType> = {}):
 // Session State Initialization Helper
 // ------------------------------
 export function createInitialSession(): StateType {
+  const memory = new ConversationTokenBufferMemory({ 
+    memoryKey: 'chat_history', 
+    llm,
+    maxTokenLimit: 2000000,
+    returnMessages: true 
+  });
+
   return {
     input: "",
     chat_history: [],
@@ -338,7 +403,7 @@ export function createInitialSession(): StateType {
     current_field: undefined,
     last_field: undefined,
     isFormfillingInterupted: false,
-    memory: new ConversationTokenBufferMemory({ memoryKey: 'chat_history', llm })
+    memory
   };
 }
 

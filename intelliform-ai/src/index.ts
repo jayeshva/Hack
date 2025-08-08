@@ -11,19 +11,14 @@ import { createLogger } from './common/logger';
 import dotenv from 'dotenv';
 import Redis from 'ioredis';
 
-
-
-
 dotenv.config();
 
 import { ChatbotAgent } from './chatbot';
 import { runGraph, StateType, createInitialSession, isValidSessionState } from './graph/graph';
-import { AIMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, BaseMessage } from '@langchain/core/messages';
 import { buildGovVectorStore } from './graph/vectorStore';
 
 const logger = createLogger('server');
-
-
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
@@ -43,6 +38,23 @@ interface FileData {
   url: string;
 }
 
+// Serializable session state (without memory object)
+interface SerializableSessionState {
+  input: string;
+  chat_history: BaseMessage[];
+  current_node: string | null;
+  last_node: string | null;
+  awaiting_input: boolean;
+  is_form_filling_started: boolean;
+  form_id?: string;
+  form_name?: string;
+  form_fields?: any[];
+  form_status?: "not_started" | "in_progress" | "completed";
+  current_field?: string;
+  last_field?: string;
+  isFormfillingInterupted: boolean;
+}
+
 class ChatWebSocketServer {
   private app: express.Application;
   private server: any;
@@ -50,8 +62,6 @@ class ChatWebSocketServer {
   private clients: Map<string, ClientConnection> = new Map();
   private chatbotAgent: ChatbotAgent;
   private upload: multer.Multer;
-
-
 
   constructor() {
     this.app = express();
@@ -87,25 +97,76 @@ class ChatWebSocketServer {
     this.setupWebSocket();
   }
 
-  async getSessionState(sessionId: string): Promise<StateType | undefined> {
+  // Fixed session state retrieval
+  async getSessionState(sessionId: string): Promise<SerializableSessionState | undefined> {
     try {
       const json = await redis.get(`session:${sessionId}`);
-      return json ? JSON.parse(json) : undefined;
+      if (!json) return undefined;
+      
+      const parsed = JSON.parse(json);
+      
+      // Reconstruct message objects from serialized data
+      if (parsed.chat_history && Array.isArray(parsed.chat_history)) {
+        parsed.chat_history = parsed.chat_history.map((msg: any) => {
+          if (msg._getType) {
+            // Already a proper message object
+            return msg;
+          }
+          // Reconstruct message based on type
+          if (msg.type === 'human' || msg.constructor?.name === 'HumanMessage') {
+            return new HumanMessage({ content: msg.content || msg.text || '' });
+          } else if (msg.type === 'ai' || msg.constructor?.name === 'AIMessage') {
+            return new AIMessage({ content: msg.content || msg.text || '' });
+          }
+          // Fallback
+          return new HumanMessage({ content: msg.content || msg.text || '' });
+        });
+      }
+      
+      return parsed;
     } catch (error) {
-      console.error("Redis get error:", error);
+      logger.error("Redis get error:", error);
       return undefined;
     }
   }
 
+  // Fixed session state saving
   async saveSessionState(sessionId: string, state: StateType): Promise<void> {
     try {
-      await redis.set(`session:${sessionId}`, JSON.stringify(state), 'EX', 60 * 60); // Expires in 1 hour
-      console.log(`Session state saved for session ${sessionId}`);
+      // Create serializable version by removing memory and converting messages
+      const serializableState: SerializableSessionState = {
+        input: state.input,
+        chat_history: state.chat_history.map(msg => ({
+          type: msg._getType(),
+          content: msg.content,
+          // Store additional properties if needed
+          ...(msg.additional_kwargs && { additional_kwargs: msg.additional_kwargs })
+        })) as any,
+        current_node: state.current_node,
+        last_node: state.last_node,
+        awaiting_input: state.awaiting_input,
+        is_form_filling_started: state.is_form_filling_started,
+        form_id: state.form_id,
+        form_name: state.form_name,
+        form_fields: state.form_fields,
+        form_status: state.form_status,
+        current_field: state.current_field,
+        last_field: state.last_field,
+        isFormfillingInterupted: state.isFormfillingInterupted
+      };
+
+      await redis.set(
+        `session:${sessionId}`, 
+        JSON.stringify(serializableState), 
+        'EX', 
+        60 * 60 * 24 // Expires in 24 hours (increased from 1 hour)
+      );
+      
+      logger.info(`Session state saved for session ${sessionId}`);
     } catch (error) {
-      console.error("Redis set error:", error);
+      logger.error("Redis set error:", error);
     }
   }
-
 
   private setupExpress() {
     // CORS configuration
@@ -129,6 +190,16 @@ class ChatWebSocketServer {
       });
     });
 
+    // Session debug endpoint
+    this.app.get('/debug/session/:sessionId', async (req, res) => {
+      try {
+        const sessionState = await this.getSessionState(req.params.sessionId);
+        res.json({ sessionId: req.params.sessionId, state: sessionState });
+      } catch (error) {
+        res.status(500).json({ error: 'Failed to get session state' });
+      }
+    });
+
     // File upload endpoint
     this.app.post('/upload', this.upload.array('files', 10), (req, res) => {
       try {
@@ -144,7 +215,7 @@ class ChatWebSocketServer {
 
         res.json({ success: true, files: fileData });
       } catch (error) {
-        console.error('File upload error:', error);
+        logger.error('File upload error:', error);
         res.status(500).json({ success: false, error: 'Upload failed' });
       }
     });
@@ -153,8 +224,13 @@ class ChatWebSocketServer {
     this.app.post('/api/chat', async (req, res) => {
       try {
         const { message, sessionId, files } = req.body;
+        
+        // Get or create session
+        let sessionState = await this.getSessionState(sessionId);
+        if (!sessionState) {
+          sessionState = createInitialSession();
+        }
 
-        // Process with AI agent
         const response = await this.chatbotAgent.chat(sessionId, message);
 
         res.json({
@@ -163,7 +239,7 @@ class ChatWebSocketServer {
           timestamp: new Date().toISOString()
         });
       } catch (error) {
-        console.error('Chat API error:', error);
+        logger.error('Chat API error:', error);
         res.status(500).json({ error: 'Chat processing failed' });
       }
     });
@@ -174,7 +250,7 @@ class ChatWebSocketServer {
       const url = new URL(request.url!, `http://${request.headers.host}`);
       const sessionId = url.searchParams.get('sessionId') || uuidv4();
 
-      console.log(`Client connected: ${sessionId}`);
+      logger.info(`Client connected: ${sessionId}`);
 
       // Store client connection
       const clientConnection: ClientConnection = {
@@ -185,11 +261,12 @@ class ChatWebSocketServer {
 
       this.clients.set(sessionId, clientConnection);
 
-      // Send welcome message
+      // Send welcome message with session info
       this.sendMessage(ws, {
         type: 'connection',
         content: 'Connected to AI Assistant',
-        sessionId
+        sessionId,
+        timestamp: new Date().toISOString()
       });
 
       // Handle messages
@@ -198,24 +275,25 @@ class ChatWebSocketServer {
           const message = JSON.parse(data.toString());
           await this.handleMessage(sessionId, message);
         } catch (error: any) {
-          console.error('Message handling error:', error);
+          logger.error('Message handling error:', error);
           this.sendMessage(ws, {
             type: 'error',
             content: 'Failed to process message',
-            error: error.message
+            error: error.message,
+            sessionId
           });
         }
       });
 
       // Handle disconnection
       ws.on('close', () => {
-        console.log(`Client disconnected: ${sessionId}`);
+        logger.info(`Client disconnected: ${sessionId}`);
         this.clients.delete(sessionId);
       });
 
       // Handle errors
       ws.on('error', (error) => {
-        console.error(`WebSocket error for ${sessionId}:`, error);
+        logger.error(`WebSocket error for ${sessionId}:`, error);
         this.clients.delete(sessionId);
       });
 
@@ -230,7 +308,7 @@ class ChatWebSocketServer {
 
       this.clients.forEach((client, sessionId) => {
         if (now.getTime() - client.lastActivity.getTime() > timeout) {
-          console.log(`Cleaning up inactive session: ${sessionId}`);
+          logger.info(`Cleaning up inactive session: ${sessionId}`);
           client.ws.close();
           this.clients.delete(sessionId);
         }
@@ -245,9 +323,11 @@ class ChatWebSocketServer {
     try {
       client.lastActivity = new Date();
 
+      // Send typing indicator
       this.sendMessage(client.ws, {
         type: 'typing',
-        isTyping: true
+        isTyping: true,
+        sessionId
       });
 
       let processedFiles: FileData[] = [];
@@ -255,36 +335,73 @@ class ChatWebSocketServer {
         processedFiles = await this.processMessageFiles(message.files);
       }
 
-      const previousState = (await this.getSessionState(sessionId) || {}) as Partial<StateType>;
+      // Get existing session or create new one
+      let previousState = await this.getSessionState(sessionId);
+      if (!previousState) {
+        logger.info(`Creating new session for ${sessionId}`);
+        previousState = createInitialSession();
+      } else {
+        logger.info(`Retrieved existing session for ${sessionId} with ${previousState.chat_history?.length || 0} messages`);
+      }
+
+      // Set current input
       previousState.input = message.content;
 
+      logger.info(`Processing message for session ${sessionId}: "${message.content}"`);
+      logger.info(`Previous chat history length: ${previousState.chat_history?.length || 0}`);
+
+      // Run the graph with the previous state
       const resultState = await runGraph(message.content, previousState);
 
+      logger.info(`New chat history length: ${resultState.chat_history?.length || 0}`);
 
-
-
+      // Get the last bot message
       const lastBotMessage = resultState.chat_history?.[resultState.chat_history.length - 1] as AIMessage;
+      const botResponse = lastBotMessage?.content || "I'm here to help you with forms and applications.";
 
-      await this.saveSessionState(sessionId, resultState);  // 💾 Save updated session
+      // Save updated session state
+      await this.saveSessionState(sessionId, resultState);
+
+      // Stop typing indicator and send response
+      this.sendMessage(client.ws, {
+        type: 'typing',
+        isTyping: false,
+        sessionId
+      });
 
       this.sendMessage(client.ws, {
         type: 'message',
-        content: lastBotMessage?.content || "Done.",
+        content: botResponse,
         sessionId,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        // Include session debug info in development
+        ...(process.env.NODE_ENV === 'development' && {
+          debug: {
+            historyLength: resultState.chat_history?.length,
+            currentNode: resultState.current_node,
+            formStatus: resultState.form_status,
+            isFormFilling: resultState.is_form_filling_started
+          }
+        })
       });
 
     } catch (error: any) {
-      console.error('Message processing error:', error);
+      logger.error('Message processing error:', error);
+
+      this.sendMessage(client.ws, {
+        type: 'typing',
+        isTyping: false,
+        sessionId
+      });
 
       this.sendMessage(client.ws, {
         type: 'error',
         content: 'Sorry, I encountered an error processing your message. Please try again.',
-        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined,
+        sessionId
       });
     }
   }
-
 
   private async processMessageFiles(files: any[]): Promise<FileData[]> {
     const processedFiles: FileData[] = [];
@@ -309,7 +426,7 @@ class ChatWebSocketServer {
           });
         }
       } catch (error) {
-        console.error('File processing error:', error);
+        logger.error('File processing error:', error);
       }
     }
 
@@ -317,20 +434,13 @@ class ChatWebSocketServer {
   }
 
   private async handleAIResponseFiles(response: string): Promise<FileData[]> {
-    // Parse AI response for file generation requests
-    // This is where you'd handle cases where the AI wants to generate files
-    // (e.g., filled forms, reports, documents)
-
     const files: FileData[] = [];
 
-    // Example: Check if AI response contains file generation instructions
     if (response.includes('[GENERATE_FORM]')) {
-      // Generate a form file
       const formContent = this.generateFormContent(response);
       const filename = `form_${uuidv4()}.pdf`;
       const filepath = path.join('uploads', filename);
 
-      // Save generated file
       await fs.promises.writeFile(filepath, formContent);
 
       files.push({
@@ -347,7 +457,6 @@ class ChatWebSocketServer {
   }
 
   private generateFormContent(response: string): Buffer {
-    // Mock form generation - replace with actual form generation logic
     const content = `Generated form based on: ${response}`;
     return Buffer.from(content, 'utf8');
   }
@@ -361,9 +470,10 @@ class ChatWebSocketServer {
   public async start(port: number = 3001) {
     await buildGovVectorStore();
     this.server.listen(port, () => {
-      console.log(`Chat server running on port ${port}`);
-      console.log(`WebSocket endpoint: ws://localhost:${port}/chat`);
-      console.log(`HTTP API endpoint: http://localhost:${port}/api/chat`);
+      logger.info(`Chat server running on port ${port}`);
+      logger.info(`WebSocket endpoint: ws://localhost:${port}/chat`);
+      logger.info(`HTTP API endpoint: http://localhost:${port}/api/chat`);
+      logger.info(`Session debug endpoint: http://localhost:${port}/debug/session/:sessionId`);
     });
   }
 
@@ -377,11 +487,9 @@ class ChatWebSocketServer {
 const chatServer = new ChatWebSocketServer();
 chatServer.start(3001);
 
-// test();
-
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('Shutting down chat server...');
+  logger.info('Shutting down chat server...');
   chatServer.stop();
   process.exit(0);
 });
