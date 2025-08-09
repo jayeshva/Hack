@@ -1,3 +1,4 @@
+
 import { buildFormAssistantToolset } from "../../tools/index";
 import { llm } from "../../config/llm";
 import { StateType } from "../graph";
@@ -9,7 +10,7 @@ import { ConversationTokenBufferMemory } from "langchain/memory";
 // Get the tools
 const tools = buildFormAssistantToolset();
 
-// Enhanced system prompt with strict accuracy requirements
+// Enhanced system prompt with strict accuracy requirements and submission handling
 const SYSTEM_PROMPT = `You are an intelligent, reliable AI assistant designed to help users apply for government or enterprise services by filling out forms step-by-step.
 
 ## CRITICAL ACCURACY REQUIREMENTS:
@@ -17,6 +18,14 @@ const SYSTEM_PROMPT = `You are an intelligent, reliable AI assistant designed to
 2. **Always provide consistent information** - Once you've fetched form structure, use that exact structure in all responses
 3. **Store and reference tool results** - Keep track of fetched data and reuse it instead of inventing new information
 4. **Be precise with field names and types** - Use the exact field names, types, and requirements from the tool response
+
+## FORM SUBMISSION CONFIRMATION HANDLING:
+When user confirms they want to submit a form or apply for a service:
+1. First fetch all available forms to identify the correct form
+2. Use the form ID to fetch the complete form structure
+3. Initialize the form filling process with the fetched structure
+4. Set is_form_filling_started = true
+5. Begin collecting field values systematically
 
 ## Core Capabilities:
 - Remember and use information from the entire conversation history
@@ -48,11 +57,14 @@ When describing form structures:
 
 ## Form Filling Protocol:
 
-1. **Starting an Application:**
-   - When a user expresses interest in applying for a service, use the available tools to fetch forms
-   - Select the appropriate form and fetch its structure using the exact form ID
-   - Store the fetched structure and use it consistently throughout the conversation
-   - Begin asking questions for each required field IN THE ORDER PROVIDED BY THE TOOL
+1. **Starting an Application (SUBMISSION CONFIRMATION):**
+   - When user confirms they want to apply/submit a form:
+     a. Use fetch_available_forms to get all available forms
+     b. Identify the appropriate form based on user's request
+     c. Use fetchFormStructureById with the correct form ID
+     d. Initialize session state with form data
+     e. Set is_form_filling_started = true
+     f. Begin asking for the first required field
 
 2. **Collecting Information:**
    - Ask for one field at a time, using the exact field name and label from the tool response
@@ -78,7 +90,8 @@ When describing form structures:
 - Keep track of tool responses and use them as the single source of truth
 - Never hallucinate or invent form fields or requirements
 - Handle errors gracefully
-- Always maintain context about the ongoing form filling process`;
+- Always maintain context about the ongoing form filling process
+- When user confirms submission, immediately start the form fetching and initialization process`;
 
 // Helper function to format messages for Bedrock compatibility
 function formatMessagesForBedrock(messages: BaseMessage[]): BaseMessage[] {
@@ -132,6 +145,59 @@ function formatMessagesForBedrock(messages: BaseMessage[]): BaseMessage[] {
 // Store tool results for consistency
 const toolResultsCache = new Map<string, any>();
 
+// Helper function to detect form submission confirmation
+function isFormSubmissionConfirmation(input: string): boolean {
+  const confirmationKeywords = [
+    'yes', 'confirm', 'submit', 'apply', 'proceed', 'start', 'begin',
+    'i want to apply', 'let\'s do it', 'go ahead', 'continue'
+  ];
+  
+  const lowerInput = input.toLowerCase().trim();
+  return confirmationKeywords.some(keyword => lowerInput.includes(keyword));
+}
+
+// Helper function to initialize form filling process
+async function initializeFormFilling(userInput: string, session: StateType): Promise<any> {
+  logger.info('Initializing form filling process...');
+  
+  try {
+    // Step 1: Fetch available forms
+    const fetchFormsResult = session.form_fields;
+  
+    
+    if ( !fetchFormsResult || fetchFormsResult?.length === 0) {
+      throw new Error('No forms available');
+    }
+
+    logger.info(`Available form fields: ${JSON.stringify(fetchFormsResult)}`);
+
+    
+    const updatedSession = {
+      ...session,
+      current_field: fetchFormsResult[0].name,
+      last_field: null,
+      awaiting_input: true,
+      form_status: 'in_progress',
+      isFormReady: false,
+      is_form_filling_started: true,
+      
+    };
+
+    return {
+      success: true,
+      session: updatedSession
+    };
+
+  } catch (error: any) {
+    logger.error(`Failed to initialize form filling: ${error}`);
+    return {
+      success: false,
+      error: error.message,
+      session: session
+    };
+  }
+}
+
 export const formAssistantAgent = async (input: string, session: StateType) => {
   logger.info(`formAssistantAgent input: ${input}`);
 
@@ -163,6 +229,77 @@ export const formAssistantAgent = async (input: string, session: StateType) => {
 
     logger.info(`Chat history length: ${chatHistory.length}`);
 
+    // Check if user is confirming form submission and form filling hasn't started
+    if (isFormSubmissionConfirmation(input) && !session.is_form_filling_started) {
+      logger.info('User confirmed form submission - initializing form filling process');
+      
+      const initResult = await initializeFormFilling(input, session);
+      
+      if (initResult.success) {
+        session = initResult.session;
+
+        logger.info(`Available form fields: ${JSON.stringify(initResult)}`);
+
+        
+        // Create response about successful initialization
+        const fields = session.form_fields || [];
+
+        logger.info(`Available form fields: ${JSON.stringify(fields)}`);
+        
+        const formattedFields = fields.map((field: any) => {
+          let fieldDesc = `- **${field.label || field.name}** (${field.type}${field.required ? ', required' : ', optional'})`;
+          if (field.instruction) {
+            fieldDesc += `: ${field.instruction}`;
+          }
+          if (field.options) {
+            fieldDesc += ` Options: ${field.options.join(', ')}`;
+          }
+          return fieldDesc;
+        }).join('\n');
+
+        const initResponse = `Perfect! I've initialized the ${session.form_name || 'application form'} for you. Here's what we'll need to complete:
+
+${formattedFields}
+
+Let's start with the first field. ${fields[0]?.required ? 'This field is required.' : 'This field is optional.'} 
+
+**${fields[0]?.name}**: ${fields[0]?.instruction || 'Please provide this information.'}`;
+
+        // Save to memory
+        await memory.saveContext(
+          { input: input.trim() },
+          { output: initResponse }
+        );
+
+        const updatedChatHistory = [
+          ...chatHistory,
+          new HumanMessage(input.trim()),
+          new AIMessage(initResponse)
+        ];
+
+        return {
+          response: initResponse,
+          ...session,
+          memory,
+          chat_history: updatedChatHistory,
+        };
+      } else {
+        const errorResponse = `I encountered an issue while setting up your form: ${initResult.error}. Please try again.`;
+        
+        await memory.saveContext(
+          { input: input.trim() },
+          { output: errorResponse }
+        );
+
+        return {
+          response: errorResponse,
+          ...session,
+          memory,
+        };
+      }
+    }
+
+    // Continue with existing flow for other cases
     // Create prompt template
     const prompt = ChatPromptTemplate.fromMessages([
       ["system", SYSTEM_PROMPT],
@@ -204,6 +341,8 @@ export const formAssistantAgent = async (input: string, session: StateType) => {
 
 ## CONVERSATION CONTEXT:
 You are in an ongoing conversation. Remember what the user has told you previously.
+Form filling started: ${session.is_form_filling_started ? 'YES' : 'NO'}
+Current form ID: ${session.form_id || 'None'}
 ${contextInfo}
 
 Available tools:
@@ -334,6 +473,7 @@ ${toolDescriptions}
                   awaiting_input: toolResult.awaiting_input ?? session.awaiting_input,
                   form_status: toolResult.form_status || session.form_status,
                   is_form_filling_started: toolResult.is_form_filling_started ?? session.is_form_filling_started,
+                  // TODO: Add space for additional state updates
                 };
               }
 
@@ -436,142 +576,6 @@ ${toolDescriptions}
 
     return {
       response: errorResponse,
-      ...session,
-    };
-  }
-};
-// Alternative: Simple tool-calling implementation without agent framework
-export const formAssistantAgentSimple = async (input: string, session: StateType) => {
-  logger.info(`formAssistantAgentSimple input: ${input}`);
-
-  try {
-    // Initialize memory
-    let memory = session.memory;
-    if (!memory) {
-      memory = new ConversationTokenBufferMemory({
-        memoryKey: "chat_history",
-        returnMessages: true,
-        llm,
-        maxTokenLimit: 2000,
-      });
-      session.memory = memory;
-    }
-
-    const memoryVars = await memory.loadMemoryVariables({});
-    const chatHistory = formatMessagesForBedrock(memoryVars.chat_history || []);
-
-    // Create a function-calling prompt
-    const toolSchemas = tools.map(tool => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.schema || {}
-    }));
-
-    const systemMessageWithTools = `${SYSTEM_PROMPT}
-
-You have access to the following functions:
-${JSON.stringify(toolSchemas, null, 2)}
-
-To use a function, respond with a JSON object in this format:
-{
-  "function_call": {
-    "name": "function_name",
-    "arguments": {}
-  }
-}
-
-For normal responses, respond with:
-{
-  "message": "your response to the user"
-}`;
-
-    // Create messages for LLM
-    const messages = [
-      new SystemMessage(systemMessageWithTools),
-      ...chatHistory.slice(-6), // Keep last 6 messages for context
-      new HumanMessage(input)
-    ];
-
-    // Invoke LLM
-    const llmResponse = await llm.invoke(messages);
-    const responseContent = typeof llmResponse.content === 'string'
-      ? llmResponse.content
-      : JSON.stringify(llmResponse.content);
-
-    // Try to parse as JSON
-    let parsedResponse;
-    try {
-      parsedResponse = JSON.parse(responseContent);
-    } catch {
-      // If not JSON, treat as plain message
-      parsedResponse = { message: responseContent };
-    }
-
-    // Handle function calls
-    if (parsedResponse.function_call) {
-      const { name, arguments: args } = parsedResponse.function_call;
-      const tool = tools.find(t => t.name === name);
-
-      if (tool) {
-        const toolResult = await tool.invoke(args);
-
-        // Update session with tool results
-        if (toolResult && typeof toolResult === 'object') {
-          Object.assign(session, {
-            form_id: toolResult.form_id || session.form_id,
-            form_name: toolResult.form_name || session.form_name,
-            form_fields: toolResult.form_fields || session.form_fields,
-            current_field: toolResult.current_field || session.current_field,
-            last_field: toolResult.last_field || session.last_field,
-            awaiting_input: toolResult.awaiting_input ?? session.awaiting_input,
-            form_status: toolResult.form_status || session.form_status,
-            is_form_filling_started: true,
-          });
-        }
-
-        // Get follow-up response
-        const followUpMessages = [
-          ...messages,
-          new SystemMessage(`Function ${name} returned: ${JSON.stringify(toolResult)}`),
-          new HumanMessage("Please provide an appropriate response to the user based on this result.")
-        ];
-
-        const followUpResponse = await llm.invoke(followUpMessages);
-        const finalMessage = typeof followUpResponse.content === 'string'
-          ? followUpResponse.content
-          : "I've processed your request. How can I help you further?";
-
-        await memory.saveContext(
-          { input: input.trim() },
-          { output: finalMessage }
-        );
-
-        return {
-          response: finalMessage,
-          ...session,
-          memory,
-        };
-      }
-    }
-
-    // Regular message response
-    const finalMessage = parsedResponse.message || responseContent;
-
-    await memory.saveContext(
-      { input: input.trim() },
-      { output: finalMessage }
-    );
-
-    return {
-      response: finalMessage,
-      ...session,
-      memory,
-    };
-
-  } catch (error) {
-    logger.error(`formAssistantAgentSimple failed: ${error}`);
-    return {
-      response: "I encountered an error. Please try again.",
       ...session,
     };
   }
